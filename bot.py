@@ -244,7 +244,7 @@ class PairsTradingBot:
                 eth_quantity = self.current_position['eth_quantity']
                 sol_quantity = self.current_position['sol_quantity']
             
-            # Round quantities according to lot size rules
+            # Adjust quantities according to lot size rules
             eth_quantity = self.calculate_position_size(current_prices['ETHUSDT'], 'ETHUSDT')
             sol_quantity = self.calculate_position_size(current_prices['SOLUSDT'], 'SOLUSDT')
             
