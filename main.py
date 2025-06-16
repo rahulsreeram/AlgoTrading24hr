@@ -5,8 +5,6 @@ import threading
 import time
 import logging
 from datetime import datetime
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from bot import PairsTradingBot
 
 # Configure page
@@ -40,6 +38,8 @@ if 'api_key' not in st.session_state:
     st.session_state.api_key = ""
 if 'api_secret' not in st.session_state:
     st.session_state.api_secret = ""
+if 'bot_data_lock' not in st.session_state:
+    st.session_state.bot_data_lock = threading.Lock()
 
 # Initialize trading parameters with defaults
 if 'trading_params' not in st.session_state:
@@ -67,42 +67,36 @@ def validate_parameters():
     
     return True
 
-def run_bot():
-    """Run the trading bot in a background thread"""
-    # Check if required session state variables exist
-    if 'api_key' not in st.session_state or 'api_secret' not in st.session_state:
-        logging.error("API credentials not found in session state")
-        st.session_state.bot_running = False
-        return
-    
-    # Check if API credentials are provided
-    if not st.session_state.api_key or not st.session_state.api_secret:
-        logging.error("API credentials are empty")
-        st.session_state.bot_running = False
-        return
-    
+def run_bot(api_key, api_secret, trading_params):
+    """Run the trading bot in a background thread with passed parameters"""
     try:
+        # Create bot instance with passed parameters (no session state access)
         bot = PairsTradingBot(
-            api_key=st.session_state.api_key,
-            api_secret=st.session_state.api_secret,
-            usdt_amount_per_leg=st.session_state.trading_params["USDT_AMOUNT_PER_LEG"],
-            rolling_window=st.session_state.trading_params["ROLLING_WINDOW"],
-            entry_zscore=st.session_state.trading_params["ENTRY_ZSCORE"],
-            exit_zscore=st.session_state.trading_params["EXIT_ZSCORE"],
-            stop_loss_zscore_threshold=st.session_state.trading_params["STOP_LOSS_ZSCORE_THRESHOLD"],
-            partial_exit_pct=st.session_state.trading_params["PARTIAL_EXIT_PCT"],
-            max_hold_period_bars=st.session_state.trading_params["MAX_HOLD_PERIOD_BARS"]
+            api_key=api_key,
+            api_secret=api_secret,
+            usdt_amount_per_leg=trading_params["USDT_AMOUNT_PER_LEG"],
+            rolling_window=trading_params["ROLLING_WINDOW"],
+            entry_zscore=trading_params["ENTRY_ZSCORE"],
+            exit_zscore=trading_params["EXIT_ZSCORE"],
+            stop_loss_zscore_threshold=trading_params["STOP_LOSS_ZSCORE_THRESHOLD"],
+            partial_exit_pct=trading_params["PARTIAL_EXIT_PCT"],
+            max_hold_period_bars=trading_params["MAX_HOLD_PERIOD_BARS"]
         )
         
-        st.session_state.bot_instance = bot
         logging.info("Bot started from Streamlit")
         
+        # Main bot loop
         while st.session_state.bot_running:
             try:
                 current_data = bot.run_single_iteration()
                 if current_data is not None:
-                    st.session_state.current_data = current_data.to_dict()
+                    # Thread-safe update of current data
+                    with st.session_state.bot_data_lock:
+                        st.session_state.current_data = current_data.to_dict()
+                        st.session_state.bot_instance = bot
+                
                 time.sleep(60)  # Wait 1 minute between iterations
+                
             except Exception as e:
                 logging.error(f"Error in bot iteration: {e}")
                 time.sleep(60)
@@ -119,6 +113,7 @@ def stop_bot():
     if st.session_state.bot_thread and st.session_state.bot_thread.is_alive():
         st.session_state.bot_thread.join(timeout=5)
     st.session_state.bot_instance = None
+    st.session_state.current_data = {}
 
 # Sidebar - API Configuration
 st.sidebar.header("🔑 API Configuration")
@@ -235,7 +230,16 @@ with col1:
             st.error("Please fix parameter validation errors before starting the bot.")
         else:
             st.session_state.bot_running = True
-            st.session_state.bot_thread = threading.Thread(target=run_bot, daemon=True)
+            # Pass credentials and parameters to thread instead of accessing session state
+            st.session_state.bot_thread = threading.Thread(
+                target=run_bot, 
+                args=(
+                    st.session_state.api_key,
+                    st.session_state.api_secret,
+                    st.session_state.trading_params.copy()
+                ),
+                daemon=True
+            )
             st.session_state.bot_thread.start()
             st.success("Bot started!")
             st.rerun()
@@ -257,16 +261,22 @@ if st.session_state.current_data:
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("ETH Price", f"${st.session_state.current_data.get('eth_price', 0):.2f}")
+        eth_price = st.session_state.current_data.get('eth_price', 0)
+        st.metric("ETH Price", f"${eth_price:.2f}")
     
     with col2:
-        st.metric("SOL Price", f"${st.session_state.current_data.get('sol_price', 0):.2f}")
+        sol_price = st.session_state.current_data.get('sol_price', 0)
+        st.metric("SOL Price", f"${sol_price:.2f}")
     
     with col3:
-        st.metric("Spread", f"{st.session_state.current_data.get('spread', 0):.4f}")
+        spread = st.session_state.current_data.get('spread', 0)
+        st.metric("Spread", f"{spread:.4f}")
     
     with col4:
         zscore = st.session_state.current_data.get('spread_zscore', 0)
+        color = "normal"
+        if abs(zscore) > st.session_state.trading_params["ENTRY_ZSCORE"]:
+            color = "inverse"
         st.metric("Z-Score", f"{zscore:.2f}")
 
 # Position information
@@ -274,17 +284,19 @@ if st.session_state.bot_instance:
     st.header("💼 Current Positions")
     
     try:
-        # Get position info from bot instance
-        positions = st.session_state.bot_instance.get_positions()
+        # Get position info from bot instance in a thread-safe way
+        with st.session_state.bot_data_lock:
+            positions = st.session_state.bot_instance.get_positions()
+        
         if positions:
             df_positions = pd.DataFrame(positions)
             st.dataframe(df_positions, use_container_width=True)
         else:
             st.info("No active positions")
-    except:
+    except Exception as e:
         st.info("Position data not available")
 
-# Trading history
+# Trading history and performance
 st.header("📈 Trading Performance")
 
 # Placeholder for performance metrics
@@ -302,7 +314,20 @@ with col3:
 with col4:
     st.metric("Today's PnL", "$0.00")
 
-# Auto-refresh
+# Market data visualization
+if st.session_state.current_data:
+    st.header("📊 Market Analysis")
+    
+    # Create a simple chart using Streamlit's built-in charting
+    if 'timestamp' in st.session_state.current_data:
+        chart_data = pd.DataFrame({
+            'ETH Price': [st.session_state.current_data.get('eth_price', 0)],
+            'SOL Price': [st.session_state.current_data.get('sol_price', 0)]
+        })
+        st.line_chart(chart_data)
+
+# Auto-refresh for running bot
 if st.session_state.bot_running:
-    time.sleep(5)
+    # Add a small delay and rerun to update the interface
+    time.sleep(2)
     st.rerun()
