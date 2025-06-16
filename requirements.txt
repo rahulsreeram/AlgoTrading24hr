@@ -1,0 +1,5 @@
+streamlit>=1.28.0
+pandas>=1.5.0
+python-binance>=1.0.16
+numpy>=1.24.0
+

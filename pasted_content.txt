@@ -1,0 +1,505 @@
+import pandas as pd
+import math
+import time
+import json
+from datetime import datetime
+import logging
+from typing import Dict, Optional, List
+from binance.client import Client
+from binance.enums import *
+
+# === CONFIG ===
+API_KEY = "48d79f2d43e209df9c9ac7297cef874d4a9692ac3c098f4c3e9867992067521e"
+API_SECRET = "83920167cd9db8c02cc7733beb2e44d3c0a409f8aa666f6385cb2010db9999c9"
+
+# Trading parameters (same as your original)
+USDT_AMOUNT_PER_LEG = 4000
+MAX_LOSS_TOTAL = 80
+ROLLING_WINDOW = 48
+ENTRY_ZSCORE = 1.5
+EXIT_ZSCORE = 0.5
+STOP_LOSS_ZSCORE_THRESHOLD = 3.0
+PARTIAL_EXIT_PCT = 0.5
+MAX_HOLD_PERIOD_BARS = 48
+
+LOT_SIZE_RULES = {
+    'ETHUSDT': {'minQty': 0.001, 'stepSize': 0.001},
+    'SOLUSDT': {'minQty': 0.1, 'stepSize': 0.1}
+}
+
+# Setup logging (same as your original)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class BinanceTestnetClient:
+    def __init__(self, api_key: str, api_secret: str):
+        # Use python-binance library with testnet=True
+        self.client = Client(api_key, api_secret, testnet=True)
+        
+    def get_account_info(self):
+        """Get futures account information"""
+        return self.client.futures_account()
+    
+    def place_order(self, symbol: str, side: str, quantity: float, order_type: str = 'MARKET'):
+        """Place order using python-binance library"""
+        try:
+            if order_type.upper() == 'MARKET':
+                order = self.client.futures_create_order(
+                    symbol=symbol,
+                    side=side.upper(),
+                    type=ORDER_TYPE_MARKET,
+                    quantity=quantity
+                )
+            else:  # LIMIT order
+                # You'd need to add price parameter for limit orders
+                raise ValueError("LIMIT orders need price parameter")
+                
+            return order
+        except Exception as e:
+            logger.error(f"Order placement failed: {e}")
+            raise e
+    
+    def get_position_info(self, symbol: str = None):
+        """Get position information"""
+        return self.client.futures_position_information(symbol=symbol)
+    
+    def get_trades(self, symbol: str, limit: int = 50):
+        """Get trade history"""
+        return self.client.futures_account_trades(symbol=symbol, limit=limit)
+
+class TradeLogger:
+    """Same TradeLogger class as your original"""
+    def __init__(self, filename: str = 'trade_logs.json'):
+        self.filename = filename
+        self.trades = []
+        self.load_trades()
+    
+    def load_trades(self):
+        try:
+            with open(self.filename, 'r') as f:
+                self.trades = json.load(f)
+        except FileNotFoundError:
+            self.trades = []
+    
+    def save_trades(self):
+        with open(self.filename, 'w') as f:
+            json.dump(self.trades, f, indent=2, default=str)
+    
+    def log_trade_entry(self, trade_id: str, symbol1: str, symbol2: str, side: str, 
+                       entry_data: dict, market_data: dict):
+        trade_entry = {
+            'trade_id': trade_id,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'ENTERED',
+            'symbol1': symbol1,
+            'symbol2': symbol2,
+            'side': side,
+            'entry_data': entry_data,
+            'market_data': market_data,
+            'orders': [],
+            'exit_data': None,
+            'pnl_analysis': None
+        }
+        self.trades.append(trade_entry)
+        self.save_trades()
+        logger.info(f"Trade entry logged: {trade_id}")
+    
+    def log_order(self, trade_id: str, order_response: dict, order_type: str):
+        for trade in self.trades:
+            if trade['trade_id'] == trade_id and trade['status'] == 'ENTERED':
+                trade['orders'].append({
+                    'timestamp': datetime.now().isoformat(),
+                    'type': order_type,
+                    'response': order_response
+                })
+                self.save_trades()
+                break
+    
+    def log_trade_exit(self, trade_id: str, exit_data: dict, pnl_analysis: dict):
+        for trade in self.trades:
+            if trade['trade_id'] == trade_id:
+                trade['status'] = 'COMPLETED'
+                trade['exit_data'] = exit_data
+                trade['pnl_analysis'] = pnl_analysis
+                self.save_trades()
+                logger.info(f"Trade exit logged: {trade_id}, PnL: ${pnl_analysis['total_pnl']:.2f}")
+                break
+
+class PairsTradingBot:
+    """Same trading logic as your original, but using python-binance client"""
+    def __init__(self, symbol1: str = 'ETHUSDT', symbol2: str = 'SOLUSDT'):
+        self.client = BinanceTestnetClient(API_KEY, API_SECRET)
+        self.trade_logger = TradeLogger()
+        self.symbol1 = symbol1
+        self.symbol2 = symbol2
+        self.position = None
+        self.data_buffer = pd.DataFrame()
+        
+    def fetch_klines(self, symbol: str, interval: str = '1m', limit: int = 100):
+        """Fetch klines using python-binance client"""
+        klines = self.client.client.futures_klines(
+            symbol=symbol,
+            interval=interval,
+            limit=limit
+        )
+        
+        df = pd.DataFrame(klines, columns=[
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+        ])
+        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+        df.set_index('open_time', inplace=True)
+        df['close'] = df['close'].astype(float)
+        return df
+    
+    def adjust_qty_to_lot_size(self, qty: float, symbol: str) -> float:
+        """Same lot size adjustment logic"""
+        rules = LOT_SIZE_RULES.get(symbol)
+        if not rules:
+            return qty
+        step = rules['stepSize']
+        min_qty = rules['minQty']
+        qty_adj = math.floor(qty / step) * step
+        if qty_adj < min_qty:
+            qty_adj = min_qty if qty >= min_qty else 0
+        return qty_adj
+    
+    def calculate_equal_dollar_qtys(self, dollar_amount: float, price1: float, price2: float):
+        """Same quantity calculation logic"""
+        qty1 = dollar_amount / price1
+        qty2 = dollar_amount / price2
+        return qty1, qty2
+    
+    def calculate_percent_spread(self, price1: float, qty1: float, price2: float, qty2: float):
+        """Same spread calculation logic"""
+        value1 = price1 * qty1
+        value2 = price2 * qty2
+        avg = (value1 + value2) / 2
+        if avg == 0:
+            return 0
+        return (value1 - value2) / avg
+    
+    def update_market_data(self):
+        """Same market data update logic"""
+        df1 = self.fetch_klines(self.symbol1, limit=ROLLING_WINDOW + 10)
+        df2 = self.fetch_klines(self.symbol2, limit=ROLLING_WINDOW + 10)
+        
+        data = pd.DataFrame({
+            self.symbol1: df1['close'],
+            self.symbol2: df2['close']
+        }).dropna()
+        
+        # Same calculations as your original
+        data['qty1_raw'], data['qty2_raw'] = zip(*data.apply(
+            lambda row: self.calculate_equal_dollar_qtys(USDT_AMOUNT_PER_LEG, row[self.symbol1], row[self.symbol2]), axis=1))
+        data['qty1'] = data.apply(lambda row: self.adjust_qty_to_lot_size(row['qty1_raw'], self.symbol1), axis=1)
+        data['qty2'] = data.apply(lambda row: self.adjust_qty_to_lot_size(row['qty2_raw'], self.symbol2), axis=1)
+        
+        data['spread'] = data.apply(lambda row: self.calculate_percent_spread(
+            row[self.symbol1], row['qty1'], row[self.symbol2], row['qty2']), axis=1)
+        
+        # Same rolling statistics
+        data['spread_mean'] = data['spread'].rolling(ROLLING_WINDOW).mean()
+        data['spread_std'] = data['spread'].rolling(ROLLING_WINDOW).std()
+        data['spread_zscore'] = (data['spread'] - data['spread_mean']) / data['spread_std']
+        
+        self.data_buffer = data
+        return data.iloc[-1]
+    
+    def enter_position(self, side: str, current_data: pd.Series):
+        """Same position entry logic"""
+        trade_id = f"{side}_{int(time.time())}"
+        
+        price1 = current_data[self.symbol1]
+        price2 = current_data[self.symbol2]
+        qty1 = round(current_data['qty1'], 3)
+        qty2 = round(current_data['qty2'], 0)
+        
+        logger.info(f"Attempting to enter {side} position - Trade ID: {trade_id}")
+        logger.info(f"{self.symbol1}: {qty1:.4f} @ {price1:.4f}")
+        logger.info(f"{self.symbol2}: {qty2:.4f} @ {price2:.4f}")
+        
+        try:
+            # Same order placement logic
+            if side == 'long':
+                order1 = self.client.place_order(self.symbol1, 'BUY', qty1)
+                self.trade_logger.log_order(trade_id, order1, 'ENTRY_LEG1_LONG')
+                
+                order2 = self.client.place_order(self.symbol2, 'SELL', qty2)
+                self.trade_logger.log_order(trade_id, order2, 'ENTRY_LEG2_SHORT')
+                
+            else:
+                order1 = self.client.place_order(self.symbol1, 'SELL', qty1)
+                self.trade_logger.log_order(trade_id, order1, 'ENTRY_LEG1_SHORT')
+                
+                order2 = self.client.place_order(self.symbol2, 'BUY', qty2)
+                self.trade_logger.log_order(trade_id, order2, 'ENTRY_LEG2_LONG')
+            
+            # Same trade logging
+            entry_data = {
+                'price1': price1,
+                'price2': price2,
+                'qty1': qty1,
+                'qty2': qty2,
+                'spread': current_data['spread'],
+                'zscore': current_data['spread_zscore']
+            }
+            
+            market_data = {
+                'spread_mean': current_data['spread_mean'],
+                'spread_std': current_data['spread_std']
+            }
+            
+            self.trade_logger.log_trade_entry(trade_id, self.symbol1, self.symbol2, side, entry_data, market_data)
+            
+            # Same position state update
+            self.position = {
+                'trade_id': trade_id,
+                'side': side,
+                'entry_index': len(self.data_buffer) - 1,
+                'entry_data': entry_data,
+                'market_data': market_data,
+                'partial_exited': False,
+                'holding_bars': 0
+            }
+            
+            logger.info(f"Position entered successfully: {trade_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to enter position: {e}")
+    
+    def exit_position(self, reason: str, current_data: pd.Series, partial: bool = False):
+        """Same exit logic as your original"""
+        if not self.position:
+            return
+            
+        trade_id = self.position['trade_id']
+        side = self.position['side']
+        
+        try:
+            # Same exit quantity calculations
+            original_qty1 = self.position['entry_data']['qty1']
+            original_qty2 = self.position['entry_data']['qty2']
+            
+            if partial:
+                exit_qty1 = original_qty1 * PARTIAL_EXIT_PCT
+                exit_qty2 = original_qty2 * PARTIAL_EXIT_PCT
+                self.position['entry_data']['qty1'] *= (1 - PARTIAL_EXIT_PCT)
+                self.position['entry_data']['qty2'] *= (1 - PARTIAL_EXIT_PCT)
+                self.position['partial_exited'] = True
+            else:
+                exit_qty1 = self.position['entry_data']['qty1']
+                exit_qty2 = self.position['entry_data']['qty2']
+            
+            exit_qty1 = self.adjust_qty_to_lot_size(exit_qty1, self.symbol1)
+            exit_qty2 = self.adjust_qty_to_lot_size(exit_qty2, self.symbol2)
+            
+            logger.info(f"Exiting position ({reason}) - Trade ID: {trade_id}")
+            
+            # Same exit order logic
+            if side == 'long':
+                order1 = self.client.place_order(self.symbol1, 'SELL', exit_qty1)
+                order_type1 = 'PARTIAL_EXIT_LEG1_SELL' if partial else 'EXIT_LEG1_SELL'
+                self.trade_logger.log_order(trade_id, order1, order_type1)
+                
+                order2 = self.client.place_order(self.symbol2, 'BUY', exit_qty2)
+                order_type2 = 'PARTIAL_EXIT_LEG2_BUY' if partial else 'EXIT_LEG2_BUY'
+                self.trade_logger.log_order(trade_id, order2, order_type2)
+                
+            else:
+                order1 = self.client.place_order(self.symbol1, 'BUY', exit_qty1)
+                order_type1 = 'PARTIAL_EXIT_LEG1_BUY' if partial else 'EXIT_LEG1_BUY'
+                self.trade_logger.log_order(trade_id, order1, order_type1)
+                
+                order2 = self.client.place_order(self.symbol2, 'SELL', exit_qty2)
+                order_type2 = 'PARTIAL_EXIT_LEG2_SELL' if partial else 'EXIT_LEG2_SELL'
+                self.trade_logger.log_order(trade_id, order2, order_type2)
+            
+            if not partial:
+                # Same PnL calculation
+                pnl_analysis = self.calculate_actual_pnl(trade_id)
+                
+                exit_data = {
+                    'price1': current_data[self.symbol1],
+                    'price2': current_data[self.symbol2],
+                    'spread': current_data['spread'],
+                    'zscore': current_data['spread_zscore'],
+                    'reason': reason
+                }
+                
+                self.trade_logger.log_trade_exit(trade_id, exit_data, pnl_analysis)
+                self.position = None
+                logger.info(f"Position closed: {trade_id}")
+            else:
+                logger.info(f"Partial exit completed: {trade_id}")
+                
+        except Exception as e:
+            logger.error(f"Failed to exit position: {e}")
+    
+    def calculate_actual_pnl(self, trade_id: str) -> dict:
+        """Same PnL calculation using python-binance client"""
+        try:
+            trades1 = self.client.get_trades(self.symbol1, limit=100)
+            trades2 = self.client.get_trades(self.symbol2, limit=100)
+            
+            # Same PnL logic as your original
+            trade_entry = None
+            for trade in self.trade_logger.trades:
+                if trade['trade_id'] == trade_id:
+                    trade_entry = trade
+                    break
+            
+            if not trade_entry:
+                return {'error': 'Trade entry not found'}
+            
+            # Same time filtering and PnL calculation logic
+            entry_time = datetime.fromisoformat(trade_entry['timestamp'])
+            
+            total_pnl = 0
+            total_fees = 0
+            
+            for trade in trades1 + trades2:
+                trade_time = datetime.fromtimestamp(int(trade['time']) / 1000)
+                if abs((trade_time - entry_time).total_seconds()) < 3600:
+                    total_pnl += float(trade['realizedPnl'])
+                    total_fees += float(trade['commission'])
+            
+            return {
+                'total_pnl': total_pnl,
+                'total_fees': total_fees
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating actual PnL: {e}")
+            return {'error': str(e)}
+    
+    def check_exit_conditions(self, current_data: pd.Series) -> tuple:
+        """Same exit condition logic"""
+        if not self.position:
+            return False, "", False
+            
+        zscore = current_data['spread_zscore']
+        self.position['holding_bars'] += 1
+        
+        # Same exit condition checks
+        current_spread = current_data['spread']
+        entry_spread = self.position['entry_data']['spread']
+        
+        spread_change = current_spread - entry_spread
+        if self.position['side'] == 'long':
+            estimated_pnl = spread_change * USDT_AMOUNT_PER_LEG * 2
+        else:
+            estimated_pnl = -spread_change * USDT_AMOUNT_PER_LEG * 2
+        
+        # Same stop loss, take profit, and exit logic
+        if (estimated_pnl <= -MAX_LOSS_TOTAL) or \
+           ((self.position['side'] == 'long' and zscore >= STOP_LOSS_ZSCORE_THRESHOLD) or \
+            (self.position['side'] == 'short' and zscore <= -STOP_LOSS_ZSCORE_THRESHOLD)):
+            return True, "STOP_LOSS", False
+        
+        if (estimated_pnl >= MAX_LOSS_TOTAL) or \
+           ((self.position['side'] == 'long' and zscore >= -ENTRY_ZSCORE) or \
+            (self.position['side'] == 'short' and zscore <= ENTRY_ZSCORE)):
+            return True, "TAKE_PROFIT", False
+        
+        if self.position['holding_bars'] >= MAX_HOLD_PERIOD_BARS:
+            return True, "MAX_HOLDING_PERIOD", False
+        
+        if (not self.position['partial_exited'] and abs(zscore) <= EXIT_ZSCORE and estimated_pnl > 0):
+            return True, "PARTIAL_EXIT_NEAR_MEAN", True
+        
+        return False, "", False
+    
+    def run(self, cycles: int = None, check_interval: int = 30):
+        """Same run logic as your original"""
+        logger.info("Starting pairs trading bot...")
+        cycle_count = 0
+        last_candle_time = None
+        
+        try:
+            while True:
+                current_data = self.update_market_data()
+                current_candle_time = current_data.name
+                
+                if last_candle_time is None or current_candle_time != last_candle_time:
+                    logger.info(f"New 1-min candle: {current_candle_time}")
+                    
+                    if pd.isna(current_data['spread_zscore']):
+                        logger.warning("Insufficient data for z-score calculation")
+                    else:
+                        zscore = current_data['spread_zscore']
+                        logger.info(f"Z-Score: {zscore:.2f}, Spread: {current_data['spread']*100:.4f}%")
+                        
+                        if self.position:
+                            should_exit, reason, is_partial = self.check_exit_conditions(current_data)
+                            if should_exit:
+                                self.exit_position(reason, current_data, partial=is_partial)
+                        else:
+                            if zscore >= ENTRY_ZSCORE:
+                                self.enter_position('short', current_data)
+                            elif zscore <= -ENTRY_ZSCORE:
+                                self.enter_position('long', current_data)
+                    
+                    last_candle_time = current_candle_time
+                    cycle_count += 1
+                    
+                    if cycles and cycle_count >= cycles:
+                        break
+                
+                elif self.position:
+                    zscore = current_data['spread_zscore']
+                    if not pd.isna(zscore):
+                        if ((self.position['side'] == 'long' and zscore >= STOP_LOSS_ZSCORE_THRESHOLD) or 
+                            (self.position['side'] == 'short' and zscore <= -STOP_LOSS_ZSCORE_THRESHOLD)):
+                            logger.warning(f"EMERGENCY STOP LOSS TRIGGERED - Z-Score: {zscore:.2f}")
+                            self.exit_position("EMERGENCY_STOP_LOSS", current_data)
+                
+                time.sleep(check_interval)
+                
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+        except Exception as e:
+            logger.error(f"Bot error: {e}")
+        finally:
+            if self.position:
+                logger.info("Closing any open positions...")
+                current_data = self.update_market_data()
+                self.exit_position("BOT_SHUTDOWN", current_data)
+
+# Same analysis function
+def analyze_completed_trades(filename: str = 'trade_logs.json'):
+    """Same trade analysis as your original"""
+    try:
+        with open(filename, 'r') as f:
+            trades = json.load(f)
+        
+        completed_trades = [t for t in trades if t['status'] == 'COMPLETED']
+        
+        if not completed_trades:
+            print("No completed trades found")
+            return
+        
+        total_pnl = sum(t['pnl_analysis']['total_pnl'] for t in completed_trades if 'total_pnl' in t['pnl_analysis'])
+        total_fees = sum(t['pnl_analysis']['total_fees'] for t in completed_trades if 'total_fees' in t['pnl_analysis'])
+        
+        print(f"\n=== TRADE ANALYSIS ===")
+        print(f"Total completed trades: {len(completed_trades)}")
+        print(f"Total PnL: ${total_pnl:.2f}")
+        print(f"Total fees: ${total_fees:.2f}")
+        print(f"Average PnL per trade: ${total_pnl/len(completed_trades):.2f}")
+        
+    except Exception as e:
+        print(f"Error analyzing trades: {e}")
+
+if __name__ == "__main__":
+    # Same usage as your original
+    bot = PairsTradingBot('ETHUSDT', 'SOLUSDT')
+    bot.run()
